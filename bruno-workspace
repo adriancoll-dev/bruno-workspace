@@ -1,0 +1,218 @@
+#!/usr/bin/env zsh
+# bruno-workspace — create or remove a Bruno workspace for the current git worktree
+#
+# Usage:
+#   bruno-workspace                        # auto-detect from current git branch
+#   bruno-workspace <branch-or-ticket>     # explicit branch name or ticket ID
+#   bruno-workspace --remove <branch>      # remove workspace (for wt pre-remove hook)
+#
+# Worktrunk integration (add to ~/.config/worktrunk/config.toml):
+#   [post-start]
+#   bruno = "bruno-workspace {{ branch }}"
+#
+#   [pre-remove]
+#   bruno = "bruno-workspace --remove {{ branch }}"
+
+set -euo pipefail
+
+BRUNO_WORKSPACES_DIR="${BRUNO_WORKSPACES_DIR:-$HOME/Documents/bruno}"
+BRUNO_PREFS="$HOME/Library/Application Support/Bruno/preferences.json"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+die()  { print -P "%F{red}error:%f $*" >&2; exit 1 }
+ok()   { print -P "%F{green}✓%f $*" }
+info() { print -P "%F{cyan}→%f $*" }
+warn() { print -P "%F{yellow}⚠%f $*" }
+
+extract_ticket() {
+  # Extract ticket ID (e.g. DEV-1582) from a branch name or any string
+  print "$1" | grep -oE '[A-Z]+-[0-9]+' | head -1
+}
+
+# ── argument parsing ──────────────────────────────────────────────────────────
+
+REMOVE=false
+BRANCH_ARG=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --remove|-r) REMOVE=true; shift ;;
+    --help|-h)
+      print "Usage: bruno-workspace [--remove] [<branch-or-ticket>]"
+      print ""
+      print "  --remove   Remove workspace instead of creating it"
+      print ""
+      print "Worktrunk hooks (~/.config/worktrunk/config.toml):"
+      print '  [post-start]'
+      print '  bruno = "bruno-workspace {{ branch }}"'
+      print ""
+      print '  [pre-remove]'
+      print '  bruno = "bruno-workspace --remove {{ branch }}"'
+      exit 0
+      ;;
+    *) BRANCH_ARG="$1"; shift ;;
+  esac
+done
+
+# ── resolve workspace name ────────────────────────────────────────────────────
+
+if [[ -n "$BRANCH_ARG" ]]; then
+  WORKSPACE_NAME=$(extract_ticket "$BRANCH_ARG")
+  if [[ -z "$WORKSPACE_NAME" ]]; then
+    # No ticket pattern found — use the arg as-is (sanitize slashes)
+    WORKSPACE_NAME="${BRANCH_ARG//\//-}"
+    warn "no ticket ID found in '$BRANCH_ARG', using '$WORKSPACE_NAME'"
+  fi
+else
+  GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) \
+    || die "not inside a git repository"
+  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  WORKSPACE_NAME=$(extract_ticket "$CURRENT_BRANCH")
+  [[ -n "$WORKSPACE_NAME" ]] \
+    || die "no ticket ID found in branch '$CURRENT_BRANCH'. Pass a name explicitly: bruno-workspace <name>"
+fi
+
+WORKSPACE_DIR="$BRUNO_WORKSPACES_DIR/$WORKSPACE_NAME"
+
+# ── remove mode ───────────────────────────────────────────────────────────────
+
+if $REMOVE; then
+  if [[ ! -d "$WORKSPACE_DIR" ]]; then
+    info "workspace not found, nothing to remove: $WORKSPACE_NAME"
+    exit 0
+  fi
+
+  # Remove from Bruno preferences
+  if [[ -f "$BRUNO_PREFS" ]]; then
+    python3 - "$BRUNO_PREFS" "$WORKSPACE_DIR" <<'PYEOF'
+import json, sys
+
+prefs_path, workspace_path = sys.argv[1], sys.argv[2]
+
+with open(prefs_path) as f:
+    data = json.load(f)
+
+workspaces = data.get("workspaces", {})
+last_opened = workspaces.get("lastOpenedWorkspaces", [])
+
+if workspace_path in last_opened:
+    last_opened.remove(workspace_path)
+    workspaces["lastOpenedWorkspaces"] = last_opened
+    data["workspaces"] = workspaces
+    with open(prefs_path, "w") as f:
+        json.dump(data, f, indent="\t")
+    print(f"\033[32m✓\033[0m removed from Bruno preferences")
+else:
+    print(f"\033[36m→\033[0m not in Bruno preferences")
+PYEOF
+  fi
+
+  # Remove symlinks inside collections/ but keep the workspace folder
+  COLLECTIONS_DIR="$WORKSPACE_DIR/collections"
+  if [[ -d "$COLLECTIONS_DIR" ]]; then
+    for link in "$COLLECTIONS_DIR"/*(N); do
+      [[ -L "$link" ]] && { rm "$link"; ok "removed symlink: $(basename "$link")"; }
+    done
+  fi
+
+  # Remove workspace folder if empty (only workspace.yml left)
+  remaining=$(find "$WORKSPACE_DIR" -not -name "workspace.yml" -not -type d | wc -l | tr -d ' ')
+  if [[ "$remaining" -eq 0 ]]; then
+    rm -rf "$WORKSPACE_DIR"
+    ok "workspace removed: $WORKSPACE_NAME"
+  else
+    warn "workspace has extra files, left in place: $WORKSPACE_DIR"
+  fi
+
+  exit 0
+fi
+
+# ── create mode ───────────────────────────────────────────────────────────────
+
+# Find git root (may already be set above)
+GIT_ROOT="${GIT_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}" \
+  || die "not inside a git repository"
+
+CURRENT_BRANCH="${CURRENT_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"
+
+# Find Bruno collection (folder containing opencollection.yml)
+BRUNO_COLLECTION=$(find "$GIT_ROOT" -maxdepth 4 -name "opencollection.yml" \
+  -exec dirname {} \; 2>/dev/null | head -1)
+[[ -n "$BRUNO_COLLECTION" ]] \
+  || die "no Bruno collection (opencollection.yml) found under $GIT_ROOT"
+
+REPO_NAME=$(basename "$GIT_ROOT")
+COLLECTIONS_DIR="$WORKSPACE_DIR/collections"
+WORKSPACE_YML="$WORKSPACE_DIR/workspace.yml"
+SYMLINK_PATH="$COLLECTIONS_DIR/$REPO_NAME"
+
+# Create workspace structure
+mkdir -p "$COLLECTIONS_DIR"
+
+if [[ ! -f "$WORKSPACE_YML" ]]; then
+  cat > "$WORKSPACE_YML" <<EOF
+opencollection: 1.0.0
+info:
+  name: "$WORKSPACE_NAME"
+  type: workspace
+
+collections:
+
+specs:
+
+docs: ''
+EOF
+  ok "workspace created: $WORKSPACE_DIR"
+else
+  info "workspace already exists: $WORKSPACE_DIR"
+fi
+
+# Create/update symlink to collection
+if [[ -L "$SYMLINK_PATH" ]]; then
+  current_target=$(readlink "$SYMLINK_PATH")
+  if [[ "$current_target" == "$BRUNO_COLLECTION" ]]; then
+    info "collection already linked: $REPO_NAME"
+  else
+    ln -sfn "$BRUNO_COLLECTION" "$SYMLINK_PATH"
+    ok "collection link updated: $REPO_NAME → $BRUNO_COLLECTION"
+  fi
+elif [[ -e "$SYMLINK_PATH" ]]; then
+  die "$SYMLINK_PATH exists but is not a symlink — remove it manually"
+else
+  ln -s "$BRUNO_COLLECTION" "$SYMLINK_PATH"
+  ok "collection linked: $REPO_NAME → $BRUNO_COLLECTION"
+fi
+
+# Register in Bruno preferences
+if [[ -f "$BRUNO_PREFS" ]]; then
+  python3 - "$BRUNO_PREFS" "$WORKSPACE_DIR" <<'PYEOF'
+import json, sys
+
+prefs_path, workspace_path = sys.argv[1], sys.argv[2]
+
+with open(prefs_path) as f:
+    data = json.load(f)
+
+workspaces = data.setdefault("workspaces", {})
+last_opened = workspaces.setdefault("lastOpenedWorkspaces", [])
+
+if workspace_path not in last_opened:
+    last_opened.insert(0, workspace_path)
+    with open(prefs_path, "w") as f:
+        json.dump(data, f, indent="\t")
+    print(f"\033[32m✓\033[0m registered in Bruno preferences")
+else:
+    print(f"\033[36m→\033[0m already in Bruno preferences")
+PYEOF
+fi
+
+# ── summary ───────────────────────────────────────────────────────────────────
+
+print ""
+print -P "%F{green}Workspace ready:%f $WORKSPACE_NAME"
+print -P "  %F{yellow}path:%f       $WORKSPACE_DIR"
+print -P "  %F{yellow}collection:%f $BRUNO_COLLECTION"
+print -P "  %F{yellow}branch:%f     $CURRENT_BRANCH"
+print ""
+print -P "%F{cyan}Restart Bruno and switch to workspace → $WORKSPACE_NAME%f"
