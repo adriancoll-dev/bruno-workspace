@@ -139,8 +139,10 @@ CURRENT_BRANCH="${CURRENT_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 # Find Bruno collection (folder containing opencollection.yml)
 BRUNO_COLLECTION=$(find "$GIT_ROOT" -maxdepth 4 -name "opencollection.yml" \
   -exec dirname {} \; 2>/dev/null | head -1)
-[[ -n "$BRUNO_COLLECTION" ]] \
-  || die "no Bruno collection (opencollection.yml) found under $GIT_ROOT"
+if [[ -z "$BRUNO_COLLECTION" ]]; then
+  info "no Bruno collection found in $REPO_NAME, skipping"
+  exit 0
+fi
 
 REPO_NAME=$(basename "$GIT_ROOT")
 COLLECTIONS_DIR="$WORKSPACE_DIR/collections"
